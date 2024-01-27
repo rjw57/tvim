@@ -9,61 +9,91 @@ from pynvim import Nvim, attach
 CMD_DUMP = 200
 
 
-class Grid(tv.TView):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._cx, self._cy = -1, -1
+class GridSurface(tv.TDrawSurface):
+    _cols: int
+    _rows: int
+
+    def __init__(self):
+        super().__init__()
         self._resize(80, 25)
 
-    def draw(self):
-        color = self.getColor(0x0301)
-        for y, line in enumerate(self._grid):
-            b = tv.TDrawBuffer()
-            for x, c in enumerate(line):
-                b.moveStr(x, c, color.at(0), 1)
-            self.writeLine(0, y, len(line), 1, b)
-        self.setCursor(self._cx, self._cy)
-        self.showCursor()
+    @property
+    def size(self):
+        pt = tv.TPoint()
+        pt.x, pt.y = self._cols, self._rows
+        return pt
 
-    def redraw_event(self, kind: str, args: list[typing.Any]):
-        if kind == "grid_resize":
-            _, w, h = args
-            self._resize(w, h)
-        elif kind == "grid_line":
-            _, row, col_start, cells, wrap = args
-            chars = []
-            for c in cells:
-                r = [" ", 0, 1]
-                r[: len(c)] = c
-                txt, _, repeat = r
-                chars.extend([txt] * repeat)
-                if wrap and col_start + len(chars) == len(self._grid[row]):
-                    self._grid[row][col_start : col_start + len(cells)] = chars
-                    chars = []
-                    row += 1
-            self._grid[row][col_start : col_start + len(cells)] = chars
-        elif kind == "grid_clear":
-            for row in self._grid:
-                row[:] = [" "] * len(row)
-        elif kind == "grid_scroll":
-            _, top, bot, left, right, rows, cols = args
-            if rows > 0:
-                for dr in range(top, bot + 1):
-                    sr = dr - rows
-                    if sr >= 0:
-                        self._grid[sr] = [c for c in self._grid[dr]]
-            else:
-                for dr in range(bot, top - 1, -1):
-                    sr = dr + rows
-                    if sr >= 0:
-                        self._grid[sr] = [c for c in self._grid[dr]]
-        elif kind == "grid_cursor_goto":
-            _, self._cy, self._cx = args
-        elif kind == "flush":
-            self.drawView()
+    def __setitem__(self, pos: tuple[int, int], cell: tv.TScreenCell):
+        x, y = pos
+        if x < 0 or x >= self._cols or y < 0 or y >= self._rows:
+            raise IndexError("Access out of bounds")
+        self.at(y, x).assign(cell)
+
+    def __getitem__(self, pos: tuple[int, int]) -> tv.TScreenCell:
+        x, y = pos
+        if x < 0 or x >= self._cols or y < 0 or y >= self._rows:
+            raise IndexError("Access out of bounds")
+        return self.at(y, x)
 
     def _resize(self, cols: int, rows: int):
-        self._grid = [[" "] * cols for _ in range(rows)]
+        self._cols = cols
+        self._rows = rows
+        self.resize(self.size)
+
+    def process_grid_event(self, kind: str, args: list[typing.Any]) -> bool:
+        if kind == "grid_resize":
+            _, w, h = args[0]
+            self._resize(w, h)
+        elif kind == "grid_line":
+            attr = tv.TColorAttr(
+                tv.TColorDesired(tv.TColorRGB(0xff, 0xff, 0xff)),
+                tv.TColorDesired(tv.TColorRGB(0x00, 0x00, 0x00)),
+            )
+            for _, row, col_start, cells, _ in args:
+                x, y = col_start, row
+                for c in cells:
+                    r = [" ", 0, 1]
+                    r[: len(c)] = c
+                    txt, _, repeat = r
+                    for _ in range(repeat):
+                        cell = tv.TScreenCell()
+                        cell._ch.moveStr(txt)
+                        cell.attr = attr
+                        self[x, y] = cell
+                        x += 1
+        elif kind == "grid_clear":
+            self.clear()
+        elif kind == "grid_scroll":
+            _, top, bot, left, right, rows, cols = args[0]
+            assert cols == 0
+            rng = range(top, bot) if rows > 0 else reversed(range(top, bot))
+            for sr in rng:
+                dr = sr - rows
+                if dr >= 0:
+                    for x in range(self._cols):
+                        self[x, dr] = self[x, sr]
+        else:
+            return False
+
+        return True
+
+
+class GridView(tv.TSurfaceView):
+    def __init__(self, bounds: tv.TRect, *args, **kwargs):
+        self._surface = GridSurface()
+        super().__init__(bounds, self._surface, *args, **kwargs)
+        self._cx, self._cy = -1, -1
+        self.setState(tv.sfCursorVis, True)
+        self.setState(tv.sfFocused, True)
+
+    def redraw_event(self, kind: str, args: list[typing.Any]):
+        if self._surface.process_grid_event(kind, args):
+            return
+        elif kind == "grid_cursor_goto":
+            _, self._cy, self._cx = args[0]
+            self.setCursor(self._cx, self._cy)
+        elif kind == "flush":
+            self.drawView()
 
 
 class DemoWindow(tv.TWindow):
@@ -75,7 +105,17 @@ class DemoWindow(tv.TWindow):
 
     def _make_grid(self, bounds: tv.TRect):
         bounds.grow(-1, -1)
-        return Grid(bounds)
+        return GridView(bounds)
+
+
+_SPECIAL_KEYS = {
+    tv.kbEnter: "<CR>",
+    tv.kbEsc: "<Esc>",
+    tv.kbLeft: "<Left>",
+    tv.kbRight: "<Right>",
+    tv.kbUp: "<Up>",
+    tv.kbDown: "<Down>",
+}
 
 
 class Application(tv.TApplication):
@@ -109,8 +149,7 @@ class Application(tv.TApplication):
             name, args = self._notification_queue.get()
             if name == "redraw":
                 for event in args:
-                    for event_args in event[1:]:
-                        self._g.redraw_event(event[0], event_args)
+                    self._g.redraw_event(event[0], event[1:])
 
     def _nvim_setup_cb(self) -> None:
         self._nvim.ui_attach(100, 25, rgb=True, ext_linegrid=True)
@@ -133,6 +172,14 @@ class Application(tv.TApplication):
             if cmd == CMD_DUMP:
                 self._dump()
             self.clearEvent(event)
+        elif event.what == tv.evKeyDown:
+            if event.keyDown.controlKeyState == tv.kbInsState:
+                txt = _SPECIAL_KEYS.get(event.keyDown.keyCode, event.keyDown.getText())
+                self._nvim.async_call(self._insert, txt)
+            self.clearEvent(event)
+
+    def _insert(self, txt: str):
+        self._nvim.feedkeys(self._nvim.replace_termcodes(txt), "t", False)
 
     @staticmethod
     def initStatusLine(r: tv.TRect) -> tv.TStatusLine:

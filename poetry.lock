@@ -267,7 +267,7 @@ develop = false
 type = "git"
 url = "https://github.com/rjw57/pytvision.git"
 reference = "HEAD"
-resolved_reference = "ebdb0f2bf6c7bf81326d0fa46bf272007a3f126e"
+resolved_reference = "eebb5f5b795c9610c390eed1c1586b26ea654bb6"
 
 [[package]]
 name = "pyyaml"
