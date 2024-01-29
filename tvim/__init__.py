@@ -1,3 +1,4 @@
+import collections
 import queue
 import shutil
 import threading
@@ -7,6 +8,36 @@ import tvision as tv
 from pynvim import Nvim, attach
 
 CMD_DUMP = 200
+
+HL_GROUPS = {}
+DEFAULT_HL_ATTR_DICT = {}
+HL_ATTR_DICTS = {}
+HL_ATTRS = {}
+
+
+def attr_dict_to_tcolorattr(attr_dict: dict[str, typing.Any]):
+    foreground = attr_dict.get("foreground", 0xFFFFFF)
+    background = attr_dict.get("background", 0xFFFFFF)
+    style = 0
+    if attr_dict.get("reverse", False):
+        style |= tv.slReverse
+    if attr_dict.get("bold", False):
+        style |= tv.slBold
+    if attr_dict.get("underline", False):
+        style |= tv.slUnderline
+    if attr_dict.get("italic", False):
+        style |= tv.slItalic
+    if attr_dict.get("strikethrough", False):
+        style |= tv.slStrike
+    return tv.TColorAttr(
+        tv.TColorDesired(
+            tv.TColorRGB((foreground >> 16) & 0xFF, (foreground >> 8) & 0xFF, foreground & 0xFF)
+        ),
+        tv.TColorDesired(
+            tv.TColorRGB((background >> 16) & 0xFF, (background >> 8) & 0xFF, background & 0xFF)
+        ),
+        style,
+    )
 
 
 class GridSurface(tv.TDrawSurface):
@@ -42,35 +73,37 @@ class GridSurface(tv.TDrawSurface):
 
     def process_grid_event(self, kind: str, args: list[typing.Any]) -> bool:
         if kind == "grid_resize":
-            _, w, h = args[0]
+            w, h = args
             self._resize(w, h)
         elif kind == "grid_line":
-            attr = tv.TColorAttr(
-                tv.TColorDesired(tv.TColorRGB(0xff, 0xff, 0xff)),
-                tv.TColorDesired(tv.TColorRGB(0x00, 0x00, 0x00)),
-            )
-            for _, row, col_start, cells, _ in args:
-                x, y = col_start, row
-                for c in cells:
-                    r = [" ", 0, 1]
-                    r[: len(c)] = c
-                    txt, _, repeat = r
-                    for _ in range(repeat):
-                        cell = tv.TScreenCell()
-                        cell._ch.moveStr(txt)
-                        cell.attr = attr
-                        self[x, y] = cell
-                        x += 1
+            row, col_start, cells, wrap = args
+            x, y = col_start, row
+            attr = HL_ATTRS[None]
+            for c in cells:
+                r = [" ", None, 1]
+                r[: len(c)] = c
+                txt, hl_id, repeat = r
+                if hl_id is not None:
+                    attr = HL_ATTRS.get(hl_id, HL_ATTRS[None])
+                for _ in range(repeat):
+                    cell = self[x, y]
+                    cell._ch.moveStr(txt)
+                    cell.attr.assign(attr)
+                    x += 1
         elif kind == "grid_clear":
-            self.clear()
+            for y in range(self._rows):
+                for x in range(self._cols):
+                    cell = self[x, y]
+                    cell._ch.moveStr(" ")
+                    cell.attr.assign(HL_ATTRS[None])
         elif kind == "grid_scroll":
-            _, top, bot, left, right, rows, cols = args[0]
+            top, bot, left, right, rows, cols = args
             assert cols == 0
             rng = range(top, bot) if rows > 0 else reversed(range(top, bot))
-            for sr in rng:
-                dr = sr - rows
-                if dr >= 0:
-                    for x in range(self._cols):
+            for dr in rng:
+                sr = dr + rows
+                if sr >= 0 and sr < self._rows:
+                    for x in range(left, right):
                         self[x, dr] = self[x, sr]
         else:
             return False
@@ -82,18 +115,18 @@ class GridView(tv.TSurfaceView):
     def __init__(self, bounds: tv.TRect, *args, **kwargs):
         self._surface = GridSurface()
         super().__init__(bounds, self._surface, *args, **kwargs)
-        self._cx, self._cy = -1, -1
-        self.setState(tv.sfCursorVis, True)
-        self.setState(tv.sfFocused, True)
+        self.options |= tv.ofSelectable
+        self.showCursor()
 
-    def redraw_event(self, kind: str, args: list[typing.Any]):
+    def redraw_event(self, kind: str, args: list[typing.Any]) -> bool:
         if self._surface.process_grid_event(kind, args):
-            return
+            return True
         elif kind == "grid_cursor_goto":
-            _, self._cy, self._cx = args[0]
-            self.setCursor(self._cx, self._cy)
-        elif kind == "flush":
-            self.drawView()
+            cy, cx = args
+            self.setCursor(cx, cy)
+        else:
+            return False
+        return True
 
 
 class DemoWindow(tv.TWindow):
@@ -102,6 +135,7 @@ class DemoWindow(tv.TWindow):
         bounds = self.getExtent()
         self.grid = self._make_grid(bounds)
         self.insert(self.grid)
+        self.grid.select()
 
     def _make_grid(self, bounds: tv.TRect):
         bounds.grow(-1, -1)
@@ -115,6 +149,7 @@ _SPECIAL_KEYS = {
     tv.kbRight: "<Right>",
     tv.kbUp: "<Up>",
     tv.kbDown: "<Down>",
+    tv.kbBack: "<BS>",
 }
 
 
@@ -122,20 +157,22 @@ class Application(tv.TApplication):
     def __init__(self, nvim: Nvim):
         super().__init__()
         self._nvim = nvim
-        self._w = DemoWindow(tv.TRect(0, 0, 102, 27), "NeoVim", tv.wnNoNumber)
-        self.deskTop.insert(self._w)
-        self._g = self._w.grid
-        self._notification_queue = queue.Queue()
+        self._input_queue = queue.Queue()
+        self._grid_map = {}
+        self._redraw_set = set()
+        self._nvim_err = None
+
+    def _get_grid(self, handle: int):
+        g = self._grid_map.get(handle)
+        if g is not None:
+            return g
+        w = DemoWindow(tv.TRect(0, 0, 102, 27), "NeoVim", tv.wnNoNumber)
+        self.deskTop.insert(w)
+        self._grid_map[handle] = w.grid
+        return w.grid
 
     def run(self) -> int:
-        self._nvim_thread = threading.Thread(
-            target=self._nvim.run_loop,
-            kwargs={
-                "request_cb": self._nvim_request_cb,
-                "notification_cb": self._nvim_notification_cb,
-                "setup_cb": self._nvim_setup_cb,
-            },
-        )
+        self._nvim_thread = threading.Thread(target=self._nvim_loop)
         self._nvim_thread.start()
         try:
             return super().run()
@@ -145,22 +182,68 @@ class Application(tv.TApplication):
             self._nvim_thread.join(0.1)
 
     def idle(self) -> None:
-        while not self._notification_queue.empty():
-            name, args = self._notification_queue.get()
-            if name == "redraw":
-                for event in args:
-                    self._g.redraw_event(event[0], event[1:])
+        if self._nvim_err is not None:
+            err, self._nvim_err = self._nvim_err, None
+            raise RuntimeError(err)
+
+    def _nvim_loop(self):
+        self._nvim.run_loop(
+            request_cb=self._nvim_request_cb,
+            notification_cb=self._nvim_notification_cb,
+            setup_cb=self._nvim_setup_cb,
+            err_cb=self._nvim_error_cb,
+        )
 
     def _nvim_setup_cb(self) -> None:
         self._nvim.ui_attach(100, 25, rgb=True, ext_linegrid=True)
         self._nvim.command(f"e {__file__}")
 
     def _nvim_request_cb(self, name: str, args: list[typing.Any]) -> typing.Any:
-        # print(f"req: n: {name!r}, a: {args!r}")
-        pass
+        print(f"req: n: {name!r}, a: {args!r}")
+
+    def _nvim_error_cb(self, err: str):
+        self._nvim_err = err
 
     def _nvim_notification_cb(self, name: str, args: list[typing.Any]) -> typing.Any:
-        self._notification_queue.put((name, args))
+        if name == "redraw":
+            for event in args:
+                kind = event[0]
+                for event_args in event[1:]:
+                    if kind in {
+                        "grid_resize",
+                        "grid_line",
+                        "grid_clear",
+                        "grid_destroy",
+                        "grid_cursor_goto",
+                        "grid_scroll",
+                    }:
+                        g = self._get_grid(event_args[0])
+                        g.redraw_event(kind, event_args[1:])
+                        self._redraw_set.add(g)
+                    elif kind == "flush":
+                        for v in self._redraw_set:
+                            v.drawView()
+                        self._redraw_set = set()
+                    elif kind == "default_colors_set":
+                        rgb_fg, rgb_bg, rgb_sp = event_args[:3]
+                        DEFAULT_HL_ATTR_DICT.update(
+                            {
+                                "foreground": rgb_fg,
+                                "background": rgb_bg,
+                                "special": rgb_sp,
+                            }
+                        )
+                        HL_ATTRS[None] = attr_dict_to_tcolorattr(DEFAULT_HL_ATTR_DICT)
+                        for k, v in HL_ATTR_DICTS.items():
+                            HL_ATTRS[k] = attr_dict_to_tcolorattr(
+                                collections.ChainMap(v, DEFAULT_HL_ATTR_DICT)
+                            )
+                    elif kind == "hl_attr_define":
+                        id, rgb_attr = event_args[:2]
+                        HL_ATTR_DICTS[id] = rgb_attr
+                        HL_ATTRS[id] = attr_dict_to_tcolorattr(
+                            collections.ChainMap(rgb_attr, DEFAULT_HL_ATTR_DICT)
+                        )
 
     def _dump(self):
         print("xx")
@@ -171,15 +254,20 @@ class Application(tv.TApplication):
             cmd = event.message.command
             if cmd == CMD_DUMP:
                 self._dump()
-            self.clearEvent(event)
         elif event.what == tv.evKeyDown:
+            txt = None
             if event.keyDown.controlKeyState == tv.kbInsState:
                 txt = _SPECIAL_KEYS.get(event.keyDown.keyCode, event.keyDown.getText())
-                self._nvim.async_call(self._insert, txt)
-            self.clearEvent(event)
+            elif event.keyDown.keyCode >= tv.kbCtrlA and event.keyDown.keyCode <= tv.kbCtrlZ:
+                txt = f"<C-{chr(ord('A') + event.keyDown.keyCode - tv.kbCtrlA)}>"
+            if txt is not None:
+                self._input_queue.put(txt)
+                self._nvim.async_call(self._insert)
 
-    def _insert(self, txt: str):
-        self._nvim.feedkeys(self._nvim.replace_termcodes(txt), "t", False)
+    def _insert(self):
+        while not self._input_queue.empty():
+            txt = self._input_queue.get()
+            self._nvim.feedkeys(self._nvim.replace_termcodes(txt), "t", False)
 
     @staticmethod
     def initStatusLine(r: tv.TRect) -> tv.TStatusLine:
