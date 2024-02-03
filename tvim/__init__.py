@@ -1,5 +1,5 @@
-import collections
 import queue
+import random
 import shutil
 import threading
 import typing
@@ -7,139 +7,23 @@ import typing
 import tvision as tv
 from pynvim import Nvim, attach
 
+from .grid import HIGHLIGHT_ATTR_MAP, Grid, GridView
+
 CMD_DUMP = 200
 
-HL_GROUPS = {}
-DEFAULT_HL_ATTR_DICT = {}
-HL_ATTR_DICTS = {}
-HL_ATTRS = {}
 
+class GridWindow(tv.TWindow):
+    _grid_view: GridView
 
-def attr_dict_to_tcolorattr(attr_dict: dict[str, typing.Any]):
-    foreground = attr_dict.get("foreground", 0xFFFFFF)
-    background = attr_dict.get("background", 0xFFFFFF)
-    style = 0
-    if attr_dict.get("reverse", False):
-        style |= tv.slReverse
-    if attr_dict.get("bold", False):
-        style |= tv.slBold
-    if attr_dict.get("underline", False):
-        style |= tv.slUnderline
-    if attr_dict.get("italic", False):
-        style |= tv.slItalic
-    if attr_dict.get("strikethrough", False):
-        style |= tv.slStrike
-    return tv.TColorAttr(
-        tv.TColorDesired(
-            tv.TColorRGB((foreground >> 16) & 0xFF, (foreground >> 8) & 0xFF, foreground & 0xFF)
-        ),
-        tv.TColorDesired(
-            tv.TColorRGB((background >> 16) & 0xFF, (background >> 8) & 0xFF, background & 0xFF)
-        ),
-        style,
-    )
-
-
-class GridSurface(tv.TDrawSurface):
-    _cols: int
-    _rows: int
-
-    def __init__(self):
-        super().__init__()
-        self._resize(80, 25)
-
-    @property
-    def size(self):
-        pt = tv.TPoint()
-        pt.x, pt.y = self._cols, self._rows
-        return pt
-
-    def __setitem__(self, pos: tuple[int, int], cell: tv.TScreenCell):
-        x, y = pos
-        if x < 0 or x >= self._cols or y < 0 or y >= self._rows:
-            raise IndexError("Access out of bounds")
-        self.at(y, x).assign(cell)
-
-    def __getitem__(self, pos: tuple[int, int]) -> tv.TScreenCell:
-        x, y = pos
-        if x < 0 or x >= self._cols or y < 0 or y >= self._rows:
-            raise IndexError("Access out of bounds")
-        return self.at(y, x)
-
-    def _resize(self, cols: int, rows: int):
-        self._cols = cols
-        self._rows = rows
-        self.resize(self.size)
-
-    def process_grid_event(self, kind: str, args: list[typing.Any]) -> bool:
-        if kind == "grid_resize":
-            w, h = args
-            self._resize(w, h)
-        elif kind == "grid_line":
-            row, col_start, cells, wrap = args
-            x, y = col_start, row
-            attr = HL_ATTRS[None]
-            for c in cells:
-                r = [" ", None, 1]
-                r[: len(c)] = c
-                txt, hl_id, repeat = r
-                if hl_id is not None:
-                    attr = HL_ATTRS.get(hl_id, HL_ATTRS[None])
-                for _ in range(repeat):
-                    cell = self[x, y]
-                    cell._ch.moveStr(txt)
-                    cell.attr.assign(attr)
-                    x += 1
-        elif kind == "grid_clear":
-            for y in range(self._rows):
-                for x in range(self._cols):
-                    cell = self[x, y]
-                    cell._ch.moveStr(" ")
-                    cell.attr.assign(HL_ATTRS[None])
-        elif kind == "grid_scroll":
-            top, bot, left, right, rows, cols = args
-            assert cols == 0
-            rng = range(top, bot) if rows > 0 else reversed(range(top, bot))
-            for dr in rng:
-                sr = dr + rows
-                if sr >= 0 and sr < self._rows:
-                    for x in range(left, right):
-                        self[x, dr] = self[x, sr]
-        else:
-            return False
-
-        return True
-
-
-class GridView(tv.TSurfaceView):
-    def __init__(self, bounds: tv.TRect, *args, **kwargs):
-        self._surface = GridSurface()
-        super().__init__(bounds, self._surface, *args, **kwargs)
-        self.options |= tv.ofSelectable
-        self.showCursor()
-
-    def redraw_event(self, kind: str, args: list[typing.Any]) -> bool:
-        if self._surface.process_grid_event(kind, args):
-            return True
-        elif kind == "grid_cursor_goto":
-            cy, cx = args
-            self.setCursor(cx, cy)
-        else:
-            return False
-        return True
-
-
-class DemoWindow(tv.TWindow):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, grid: Grid, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        bounds = self.getExtent()
-        self.grid = self._make_grid(bounds)
-        self.insert(self.grid)
-        self.grid.select()
-
-    def _make_grid(self, bounds: tv.TRect):
-        bounds.grow(-1, -1)
-        return GridView(bounds)
+        extent = self.getExtent()
+        extent.grow(-1, -1)
+        self._grid_view = GridView(grid, extent)
+        self._grid_view.growMode = tv.gfGrowHiX | tv.gfGrowHiY
+        self._grid_view.options = tv.ofSelectable | tv.ofFramed
+        self.insert(self._grid_view)
+        self._grid_view.select()
 
 
 _SPECIAL_KEYS = {
@@ -154,22 +38,30 @@ _SPECIAL_KEYS = {
 
 
 class Application(tv.TApplication):
+    _grid_map: dict[int, Grid]
+    _grids_to_refresh: set[int]
+
     def __init__(self, nvim: Nvim):
         super().__init__()
         self._nvim = nvim
         self._input_queue = queue.Queue()
         self._grid_map = {}
+        self._grids_to_refresh = set()
         self._redraw_set = set()
         self._nvim_err = None
+        self._get_grid(1)
 
-    def _get_grid(self, handle: int):
-        g = self._grid_map.get(handle)
-        if g is not None:
-            return g
-        w = DemoWindow(tv.TRect(0, 0, 102, 27), "NeoVim", tv.wnNoNumber)
-        self.deskTop.insert(w)
-        self._grid_map[handle] = w.grid
-        return w.grid
+    def _get_grid(self, grid_handle: int) -> Grid:
+        try:
+            return self._grid_map[grid_handle]
+        except KeyError:
+            grid = Grid(self._nvim, grid_handle)
+            self._grid_map[grid_handle] = grid
+            r = tv.TRect(0, 0, 85, 28)
+            r.move(random.randint(0, 10), random.randint(0, 5))
+            w = GridWindow(grid, r, "NeoVim", tv.wnNoNumber)
+            self.deskTop.insert(w)
+            return grid
 
     def run(self) -> int:
         self._nvim_thread = threading.Thread(target=self._nvim_loop)
@@ -209,43 +101,39 @@ class Application(tv.TApplication):
             for event in args:
                 kind = event[0]
                 for event_args in event[1:]:
-                    if kind in {
-                        "grid_resize",
-                        "grid_line",
-                        "grid_clear",
-                        "grid_destroy",
-                        "grid_cursor_goto",
-                        "grid_scroll",
-                    }:
-                        g = self._get_grid(event_args[0])
-                        g.redraw_event(kind, event_args[1:])
-                        self._redraw_set.add(g)
-                    elif kind == "flush":
-                        for v in self._redraw_set:
-                            v.drawView()
-                        self._redraw_set = set()
-                    elif kind == "default_colors_set":
-                        rgb_fg, rgb_bg, rgb_sp = event_args[:3]
-                        DEFAULT_HL_ATTR_DICT.update(
-                            {
-                                "foreground": rgb_fg,
-                                "background": rgb_bg,
-                                "special": rgb_sp,
-                            }
-                        )
-                        HL_ATTRS[None] = attr_dict_to_tcolorattr(DEFAULT_HL_ATTR_DICT)
-                        for k, v in HL_ATTR_DICTS.items():
-                            HL_ATTRS[k] = attr_dict_to_tcolorattr(
-                                collections.ChainMap(v, DEFAULT_HL_ATTR_DICT)
-                            )
-                    elif kind == "hl_attr_define":
-                        id, rgb_attr = event_args[:2]
-                        HL_ATTR_DICTS[id] = rgb_attr
-                        HL_ATTRS[id] = attr_dict_to_tcolorattr(
-                            collections.ChainMap(rgb_attr, DEFAULT_HL_ATTR_DICT)
-                        )
+                    self._nvim_redraw_event(kind, event_args)
+
+    def _nvim_redraw_event(self, kind: str, args: typing.Sequence[typing.Any]):
+        if kind == "grid_line":
+            grid, row, col_start, cells, wrap = args[:5]
+            self._get_grid(grid).grid_line_event(row, col_start, cells, wrap)
+            self._grids_to_refresh.add(grid)
+        elif kind == "grid_cursor_goto":
+            grid, row, column = args[:3]
+            self._get_grid(grid).grid_cursor_goto_event(row, column)
+            self._grids_to_refresh.add(grid)
+        elif kind == "grid_destroy":
+            pass  # TODO
+        elif kind == "grid_scroll":
+            grid, top, bot, left, right, rows, cols = args[:7]
+            self._get_grid(grid).grid_scroll(top, bot, left, right, rows, cols)
+            self._grids_to_refresh.add(grid)
+        elif kind == "grid_clear":
+            pass  # TODO
+        elif kind == "flush":
+            for handle in self._grids_to_refresh:
+                self._get_grid(handle).flush_event()
+            self._grids_to_refresh.clear()
+        elif kind == "default_colors_set":
+            rgb_fg, rgb_bg, rgb_sp = args[:3]
+            HIGHLIGHT_ATTR_MAP.default_colors_set(rgb_fg, rgb_bg, rgb_sp)
+        elif kind == "hl_attr_define":
+            id, attr_dict = args[:2]
+            HIGHLIGHT_ATTR_MAP.hl_attr_define(id, attr_dict)
 
     def _dump(self):
+        for r in self._get_grid(1)._cells:
+            print("".join(c.text for c in r))
         print("xx")
 
     def handleEvent(self, event: tv.TEvent):
